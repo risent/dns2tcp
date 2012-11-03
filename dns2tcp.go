@@ -56,14 +56,13 @@ func Itob(x uint16) bool {
 }
 
 func getDomainName(data []byte, cursor int) (name string, offset int) {
-	over := false
 	n := 0
 	ptr := 0
 	length := len(data[cursor:])
 	labels := make([]string, 63)
 
 Loop:
-	for ; !over; n++ {
+	for ; ; n++ {
 		if cursor >= len(data) {
 			return "", len(data)
 		}
@@ -90,6 +89,7 @@ Loop:
 			labels[n] = string(label)
 			cursor += size
 		case 0xC0:
+			//ignore the empty data in the  labels
 			n--
 			if ptr == 0 {
 				offset = cursor
@@ -112,6 +112,27 @@ Loop:
 		return name, offset + 1
 	}
 	return name, cursor
+}
+
+func parseRR(data []byte, cursor int) (dnsRR, int) {
+	var rr dnsRR
+	rr.Name, cursor = getDomainName(data, cursor)
+	rr.Rrtype = binary.BigEndian.Uint16(data[cursor:])
+	cursor += 2
+	rr.Class = binary.BigEndian.Uint16(data[cursor:])
+	cursor += 2
+	rr.Ttl = binary.BigEndian.Uint32(data[cursor:])
+	cursor += 4
+	rr.Rdlength = binary.BigEndian.Uint16(data[cursor:])
+	cursor += 2
+	Data := make([]byte, rr.Rdlength)
+	err := binary.Read(bytes.NewBuffer(data[cursor:]), binary.BigEndian, &Data)
+	if err != nil {
+		log.Fatal(err)
+	}
+	rr.Data = Data
+	cursor += int(rr.Rdlength)
+	return rr, cursor
 }
 
 func parseDNSMsg(data []byte) dnsMsg {
@@ -149,24 +170,27 @@ func parseDNSMsg(data []byte) dnsMsg {
 		log.Printf("answer number: %d cursor: %d", msg.answer_num, cursor)
 		answer := make([]dnsRR, msg.answer_num)
 		for i := 0; i < int(msg.answer_num); i++ {
-			answer[i].Name, cursor = getDomainName(data, cursor)
-			answer[i].Rrtype = binary.BigEndian.Uint16(data[cursor:])
-			cursor += 2
-			answer[i].Class = binary.BigEndian.Uint16(data[cursor:])
-			cursor += 2
-			answer[i].Ttl = binary.BigEndian.Uint32(data[cursor:])
-			cursor += 4
-			answer[i].Rdlength = binary.BigEndian.Uint16(data[cursor:])
-			cursor += 2
-			Data := make([]byte, answer[i].Rdlength)
-			err := binary.Read(bytes.NewBuffer(data[cursor:]), binary.BigEndian, &Data)
-			if err != nil {
-				log.Fatal(err)
-			}
-			answer[i].Data = Data
-			cursor += int(answer[i].Rdlength)
+			answer[i], cursor = parseRR(data, cursor)
 		}
 		msg.answer = answer
+	}
+
+	if msg.authority_num > 0 {
+		log.Printf("authority number: %d cursor: %d", msg.authority_num, cursor)
+		ns := make([]dnsRR, msg.authority_num)
+		for i := 0; i < int(msg.authority_num); i++ {
+			ns[i], cursor = parseRR(data, cursor)
+		}
+		msg.ns = ns
+	}
+
+	if msg.additional_num > 0 {
+		log.Printf("additional  number: %d cursor: %d", msg.additional_num, cursor)
+		extra := make([]dnsRR, msg.additional_num)
+		for i := 0; i < int(msg.authority_num); i++ {
+			extra[i], cursor = parseRR(data, cursor)
+		}
+		msg.extra = extra
 	}
 	return msg
 }
@@ -225,9 +249,9 @@ func dnsListen(conn net.UDPConn) {
 	}
 }
 
-func main() {                
+func main() {
 	udpAddr, err := net.ResolveUDPAddr("up4", ":53")
-	conn, err := net.ListenUDP("udp",udpAddr)
+	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
