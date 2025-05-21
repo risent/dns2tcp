@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"errors"
 )
 
 const DNSSERVER = "8.8.8.8:53"
@@ -55,68 +56,115 @@ func Itob(x uint16) bool {
 	return true
 }
 
-func getDomainName(data []byte, cursor int) (name string, offset int) {
-	n := 0
-	ptr := 0
-	length := len(data[cursor:])
-	labels := make([]string, 63)
+// getDomainName parses a domain name from DNS message data.
+// It returns the parsed domain name and the next cursor position in the original data buffer.
+// If parsing fails, it returns an empty string, the original cursor, and an error.
+func getDomainName(data []byte, initialCursor int) (string, int, error) {
+	var labels []string
+	currentReadPos := initialCursor
+	pointerFollowCount := 0
+	posAfterFirstPointer := 0 // Stores the cursor position immediately after the first pointer sequence.
 
-Loop:
-	for ; ; n++ {
-		if cursor >= len(data) {
-			return "", len(data)
-		}
-		labelsize := data[cursor]
-		cursor++
-		if labelsize == 0 {
-			break Loop
+	for {
+		if currentReadPos >= len(data) {
+			log.Printf("Error: Reached end of data buffer while parsing domain name.")
+			return "", initialCursor, errors.New("reached end of data buffer")
 		}
 
-		switch labelsize & 0xC0 {
-		case 0x00:
-			if labelsize == 0x00 {
-				break Loop
-			}
-			label := make([]byte, labelsize)
-			size, err := bytes.NewBuffer(data[cursor:]).Read(label)
-			// cursor++
-			if err != nil {
-				log.Fatal(err)
-			}
-			if size != int(labelsize) {
-				log.Printf("Error in read %d, bytes of %x", size, label)
-			}
-			labels[n] = string(label)
-			cursor += size
-		case 0xC0:
-			//ignore the empty data in the  labels
-			n--
-			if ptr == 0 {
-				offset = cursor
-			}
-			if ptr > 10 {
-				return "Too many compression pointers", offset
-			}
-			ptr++
+		labelSize := data[currentReadPos]
+		currentReadPos++
 
-			c1 := int(data[cursor])
-			cursor = (int(labelsize)^0xC0)<<8 | int(c1)
-		default:
-			return "", length
+		if labelSize == 0 { // End of domain name
+			break
+		}
+
+		switch labelSize & 0xC0 {
+		case 0x00: // It's a label
+			if currentReadPos+int(labelSize) > len(data) {
+				log.Printf("Error: Label length exceeds data buffer boundaries.")
+				return "", initialCursor, errors.New("label length exceeds data buffer")
+			}
+			label := string(data[currentReadPos : currentReadPos+int(labelSize)])
+			labels = append(labels, label)
+			currentReadPos += int(labelSize)
+		case 0xC0: // It's a pointer
+			if pointerFollowCount == 0 {
+				// Store the position *after* this 2-byte pointer sequence.
+				// The first byte (labelSize) is already read, currentReadPos is at the second byte.
+				// So, after reading the second byte, the position will be currentReadPos + 1.
+				posAfterFirstPointer = currentReadPos + 1
+			}
+			pointerFollowCount++
+
+			if pointerFollowCount > 10 { // Arbitrary limit to prevent pointer loops
+				log.Printf("Error: Too many compression pointers.")
+				retCursor := initialCursor // Default to initialCursor if no pointer was even successfully started
+				if posAfterFirstPointer != 0 { // If at least one pointer sequence was started
+					retCursor = posAfterFirstPointer
+				}
+				// The problem states "return ("Too many compression pointers", offset)" is acceptable.
+				// We adapt this to the new signature by returning the specific string in the name field.
+				return "Too many compression pointers", retCursor, errors.New("too many compression pointers")
+			}
+
+			if currentReadPos >= len(data) { // Boundary check for the second byte of the pointer
+				log.Printf("Error: Reached end of data buffer while reading pointer offset.")
+				return "", initialCursor, errors.New("incomplete pointer offset")
+			}
+			secondByte := data[currentReadPos]
+			// currentReadPos is already incremented for labelSize, so for the second byte of the pointer,
+			// it's effectively currentReadPos (which is initialCursor + 1 + pointerFollowCount*0 -1 +1 = initialCursor+1 if first element is pointer)
+			// No, currentReadPos was incremented *after* reading labelSize. So it points to the second byte.
+			// We need to increment it *after* using it for pointerDestination.
+
+			pointerDestination := ((int(labelSize) & 0x3F) << 8) | int(secondByte)
+
+			if pointerDestination < 0 || pointerDestination >= len(data) {
+				log.Printf("Error: Invalid pointer destination: %d.", pointerDestination)
+				return "", initialCursor, errors.New("invalid pointer destination")
+			}
+			// After successfully reading the second byte of the pointer, the main loop's currentReadPos
+			// for the *next* iteration should be the pointerDestination.
+			// However, if this is the *first* pointer encountered, the function should eventually return
+			// the position *after* this first pointer. This is already stored in posAfterFirstPointer.
+			currentReadPos = pointerDestination // Jump to the pointer destination for further label parsing
+			// We don't increment currentReadPos here for the main loop because the destination
+			// is an absolute offset. The next iteration will read labelSize from there.
+
+		default: // Invalid label type
+			log.Printf("Error: Invalid label type encountered: %x", labelSize)
+			return "", initialCursor, errors.New("invalid label type")
 		}
 	}
 
-	name = strings.Join(labels[0:n], ".")
-	log.Printf("name=%s", name)
-	if ptr != 0 {
-		return name, offset + 1
+	name := strings.Join(labels, ".")
+	// log.Printf("name=%s", name) // Kept for debugging if necessary, but can be removed for production
+
+	if pointerFollowCount > 0 {
+		// If pointers were followed, return the name and the position after the *first* pointer.
+		return name, posAfterFirstPointer, nil
 	}
-	return name, cursor
+	// If no pointers were followed, return the name and the position after the null terminator.
+	return name, currentReadPos, nil
 }
 
-func parseRR(data []byte, cursor int) (dnsRR, int) {
+
+func parseRR(data []byte, cursor int) (dnsRR, int, error) {
 	var rr dnsRR
-	rr.Name, cursor = getDomainName(data, cursor)
+	var err error
+
+	rr.Name, cursor, err = getDomainName(data, cursor)
+	if err != nil {
+		log.Printf("Error parsing domain name in RR: %v", err)
+		return rr, cursor, err // Propagate error
+	}
+
+	// Ensure there's enough data for RR header fields
+	if cursor+10 > len(data) { // Rrtype(2) + Class(2) + Ttl(4) + Rdlength(2) = 10 bytes
+		log.Printf("Error: Insufficient data for RR header at cursor %d", cursor)
+		return rr, cursor, errors.New("insufficient data for RR header")
+	}
+
 	rr.Rrtype = binary.BigEndian.Uint16(data[cursor:])
 	cursor += 2
 	rr.Class = binary.BigEndian.Uint16(data[cursor:])
@@ -125,20 +173,34 @@ func parseRR(data []byte, cursor int) (dnsRR, int) {
 	cursor += 4
 	rr.Rdlength = binary.BigEndian.Uint16(data[cursor:])
 	cursor += 2
-	Data := make([]byte, rr.Rdlength)
-	err := binary.Read(bytes.NewBuffer(data[cursor:]), binary.BigEndian, &Data)
-	if err != nil {
-		log.Fatal(err)
+
+	// Check for RDATA boundary
+	if cursor+int(rr.Rdlength) > len(data) {
+		log.Printf("Error: RDATA length %d exceeds data buffer boundaries at cursor %d", rr.Rdlength, cursor)
+		return rr, cursor, errors.New("rdata length exceeds data buffer")
 	}
+
+	Data := make([]byte, rr.Rdlength)
+	copy(Data, data[cursor:cursor+int(rr.Rdlength)])
+	// Removed: err := binary.Read(bytes.NewBuffer(data[cursor:]), binary.BigEndian, &Data)
+	// Removed: log.Fatal(err) for binary.Read
+
 	rr.Data = Data
 	cursor += int(rr.Rdlength)
-	return rr, cursor
+	return rr, cursor, nil
 }
 
-func parseDNSMsg(data []byte) dnsMsg {
+func parseDNSMsg(data []byte) (dnsMsg, error) {
 	var msg dnsMsg
+	var err error // To hold errors from called functions
+
+	// Basic check for minimum DNS header size
+	if len(data) < 12 {
+		log.Printf("Error: Data too short for DNS header (%d bytes)", len(data))
+		return msg, errors.New("data too short for DNS header")
+	}
+
 	msg.id = binary.BigEndian.Uint16(data)
-	// var dnsmisc uint16
 	dnsmisc := binary.BigEndian.Uint16(data[2:])
 	msg.response = true
 	msg.opcode = uint((dnsmisc >> 11) & 0x000F)
@@ -153,12 +215,22 @@ func parseDNSMsg(data []byte) dnsMsg {
 	msg.authority_num = binary.BigEndian.Uint16(data[8:])
 	msg.additional_num = binary.BigEndian.Uint16(data[10:])
 
-	question := make([]dnsQuestion, msg.question_num)
 	cursor := 12
+	question := make([]dnsQuestion, msg.question_num)
 	for i := 0; i < int(msg.question_num); i++ {
-		// var nameLength int
-		question[i].Name, cursor = getDomainName(data, cursor)
-		// cursor += offset
+		if cursor >= len(data) {
+			log.Printf("Error: Reached end of data parsing questions (num: %d, index: %d)", msg.question_num, i)
+			return msg, errors.New("EOF parsing questions")
+		}
+		question[i].Name, cursor, err = getDomainName(data, cursor)
+		if err != nil {
+			log.Printf("Error parsing domain name in Question %d: %v", i, err)
+			return msg, err // Propagate error
+		}
+		if cursor+4 > len(data) { // Qtype(2) + Qclass(2) = 4 bytes
+			log.Printf("Error: Insufficient data for Qtype/Qclass in Question %d at cursor %d", i, cursor)
+			return msg, errors.New("insufficient data for Qtype/Qclass")
+		}
 		question[i].Qtype = binary.BigEndian.Uint16(data[cursor:])
 		cursor += 2
 		question[i].Qclass = binary.BigEndian.Uint16(data[cursor:])
@@ -167,67 +239,120 @@ func parseDNSMsg(data []byte) dnsMsg {
 	msg.question = question
 
 	if msg.answer_num > 0 {
-		log.Printf("answer number: %d cursor: %d", msg.answer_num, cursor)
+		// log.Printf("answer number: %d cursor: %d", msg.answer_num, cursor)
 		answer := make([]dnsRR, msg.answer_num)
 		for i := 0; i < int(msg.answer_num); i++ {
-			answer[i], cursor = parseRR(data, cursor)
+			if cursor >= len(data) {
+				log.Printf("Error: Reached end of data parsing answers (num: %d, index: %d)", msg.answer_num, i)
+				return msg, errors.New("EOF parsing answers")
+			}
+			answer[i], cursor, err = parseRR(data, cursor)
+			if err != nil {
+				log.Printf("Error parsing Answer RR %d: %v", i, err)
+				return msg, err // Propagate error
+			}
 		}
 		msg.answer = answer
 	}
 
 	if msg.authority_num > 0 {
-		log.Printf("authority number: %d cursor: %d", msg.authority_num, cursor)
+		// log.Printf("authority number: %d cursor: %d", msg.authority_num, cursor)
 		ns := make([]dnsRR, msg.authority_num)
 		for i := 0; i < int(msg.authority_num); i++ {
-			ns[i], cursor = parseRR(data, cursor)
+			if cursor >= len(data) {
+				log.Printf("Error: Reached end of data parsing authority RRs (num: %d, index: %d)", msg.authority_num, i)
+				return msg, errors.New("EOF parsing authority RRs")
+			}
+			ns[i], cursor, err = parseRR(data, cursor)
+			if err != nil {
+				log.Printf("Error parsing Authority RR %d: %v", i, err)
+				return msg, err // Propagate error
+			}
 		}
 		msg.ns = ns
 	}
 
 	if msg.additional_num > 0 {
-		log.Printf("additional  number: %d cursor: %d", msg.additional_num, cursor)
+		// log.Printf("additional  number: %d cursor: %d", msg.additional_num, cursor)
 		extra := make([]dnsRR, msg.additional_num)
-		for i := 0; i < int(msg.authority_num); i++ {
-			extra[i], cursor = parseRR(data, cursor)
+		for i := 0; i < int(msg.additional_num); i++ { // Corrected loop to use msg.additional_num
+			if cursor >= len(data) {
+				log.Printf("Error: Reached end of data parsing additional RRs (num: %d, index: %d)", msg.additional_num, i)
+				return msg, errors.New("EOF parsing additional RRs")
+			}
+			extra[i], cursor, err = parseRR(data, cursor)
+			if err != nil {
+				log.Printf("Error parsing Additional RR %d: %v", i, err)
+				return msg, err // Propagate error
+			}
 		}
 		msg.extra = extra
 	}
-	return msg
+	return msg, nil
 }
 
 func dnsRequest(data []byte) []byte {
-	conn, err := net.Dial("tcp", DNSSERVER)
-	if err != nil {
-		log.Fatal(err)
+	conn, errConn := net.Dial("tcp", DNSSERVER)
+	if errConn != nil {
+		// Changed log.Fatal to log.Printf and return empty slice
+		log.Printf("Error connecting to DNS server: %v", errConn)
+		return []byte{}
 	}
+	defer conn.Close()
 
-	query := parseDNSMsg(data)
-	log.Printf("query: %v", query)
+	query, errQuery := parseDNSMsg(data)
+	if errQuery != nil {
+		log.Printf("Error parsing DNS query: %v. Query: %v", errQuery, data)
+		// As per requirements, can return existing reply data (none here yet) or empty.
+		return []byte{}
+	}
+	log.Printf("Parsed query: %+v", query) // Using %+v for better struct logging
+
 	req := make([]byte, 2)
 	binary.BigEndian.PutUint16(req, uint16(len(data)))
 	req = append(req, data...)
-	_, err = conn.Write(req)
-	if err != nil {
-		log.Fatal(err)
+	_, errWrite := conn.Write(req)
+	if errWrite != nil {
+		log.Printf("Error writing DNS query to connection: %v", errWrite)
+		return []byte{}
 	}
 
-	reply := make([]byte, 1024)
-	_, err = conn.Read(reply)
-	if err != nil {
-		log.Fatal(err)
+	reply := make([]byte, 1024) // Standard buffer size for DNS replies
+	nRead, errRead := conn.Read(reply)
+	if errRead != nil {
+		log.Printf("Error reading DNS reply from connection: %v", errRead)
+		return []byte{}
+	}
+
+	if nRead < 2 { // Must have at least 2 bytes for the length field
+		log.Printf("Error: DNS reply too short to contain length field (read %d bytes)", nRead)
+		return []byte{}
 	}
 
 	var length uint16
 	s := bytes.NewBuffer(reply[:2])
-	err = binary.Read(s, binary.BigEndian, &length)
-	if err != nil {
-		log.Fatal(err)
+	errLength := binary.Read(s, binary.BigEndian, &length)
+	if errLength != nil {
+		log.Printf("Error reading length from DNS reply: %v", errLength)
+		return []byte{}
 	}
-	defer conn.Close()
 
-	msg := parseDNSMsg(reply[2 : length+2])
-	log.Printf("reply: %v", msg)
-	return reply[2 : length+2]
+	if nRead < int(length+2) {
+		log.Printf("Error: DNS reply message length (%d) is shorter than specified length field (%d)", nRead-2, length)
+		return reply[2:nRead] // Return what was read, truncated if necessary
+	}
+	
+	// Correct slice of reply to parse
+	actualReplyData := reply[2 : length+2]
+
+	msg, errParseReply := parseDNSMsg(actualReplyData)
+	if errParseReply != nil {
+		log.Printf("Error parsing DNS reply message: %v. Reply data: %x", errParseReply, actualReplyData)
+		return actualReplyData // Return the raw reply data as per requirement
+	}
+
+	log.Printf("Parsed reply: %+v", msg) // Using %+v for better struct logging
+	return actualReplyData
 }
 
 func dnsListen(conn net.UDPConn) {
