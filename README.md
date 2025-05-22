@@ -1,19 +1,31 @@
 dns2tcp
 =======
 
-A DNS tcp proxy with some capture for practice.
+A DNS proxy that forwards local UDP DNS queries to a DNSCrypt v2 resolver.
 
 ## Usage
 
-This tool acts as a UDP DNS proxy that forwards DNS queries received on UDP port 53 to a designated DNS server over TCP (currently hardcoded to Google's `8.8.8.8:53`).
+This tool acts as a local DNS proxy, receiving standard DNS queries on UDP port 53 and forwarding them securely to a DNSCrypt v2 resolver.
 
-To run the application:
+**Running the Application:**
+
+By default, `dns2tcp` uses a pre-configured public DNSCrypt resolver (AdGuard DNS):
 ```bash
 # Requires privileges to bind to port 53, often sudo is needed.
 sudo ./dns2tcp
 ```
 
-To test if it's working, you can point a DNS client like `dig` or `nslookup` to `127.0.0.1`:
+**Using a Custom DNSCrypt Resolver:**
+
+You can specify a different DNSCrypt v2 resolver using its DNS Stamp string via the `-stamp` command-line flag:
+```bash
+sudo ./dns2tcp -stamp "sdns://YOUR_DNSCRYPT_STAMP_HERE"
+```
+Public DNSCrypt resolver stamps can be found on sites like [https://dnscrypt.info/stamps](https://dnscrypt.info/stamps) and other curated lists.
+
+**Testing:**
+
+Once `dns2tcp` is running, you can point a DNS client like `dig` or `nslookup` to `127.0.0.1` to test it:
 ```bash
 dig @127.0.0.1 yourdomain.com
 ```
@@ -45,8 +57,3 @@ Unit tests are provided to verify functionality, especially the DNS message pars
    ```bash
    go test -v
    ```
-
-TODO
-----
-
-1. DNSCrypt support.

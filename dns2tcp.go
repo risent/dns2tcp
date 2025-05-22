@@ -1,15 +1,25 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"log"
 	"net"
 	"strings"
 	"errors"
+	"time"
+	"flag" // Added flag package
+
+	"github.com/ameshkov/dnscrypt/v2"
+	"github.com/miekg/dns"
 )
 
-const DNSSERVER = "8.8.8.8:53"
+// const DNSSERVER = "8.8.8.8:53" // No longer used for TCP forwarding
+
+// Global variables for DNSCrypt client and resolver info
+var cryptClient *dnscrypt.Client
+var cryptResolverInfo *dnscrypt.ResolverInfo
+var stampToUse string // To store the stamp selected via flag or default
+const defaultDnsCryptStamp = "sdns://AQMAAAAAAAAAETk0LjE0MC4xNC4xNDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20" // AdGuard DNS
 
 type dnsMsgHdr struct {
 	id                  uint16
@@ -291,95 +301,114 @@ func parseDNSMsg(data []byte) (dnsMsg, error) {
 	return msg, nil
 }
 
-func dnsRequest(data []byte) []byte {
-	conn, errConn := net.Dial("tcp", DNSSERVER)
-	if errConn != nil {
-		// Changed log.Fatal to log.Printf and return empty slice
-		log.Printf("Error connecting to DNS server: %v", errConn)
-		return []byte{}
-	}
-	defer conn.Close()
+func dnsRequest(queryBytes []byte) ([]byte, error) {
+	// cryptClient and cryptResolverInfo are now global and initialized in main()
 
-	query, errQuery := parseDNSMsg(data)
-	if errQuery != nil {
-		log.Printf("Error parsing DNS query: %v. Query: %v", errQuery, data)
-		// As per requirements, can return existing reply data (none here yet) or empty.
-		return []byte{}
-	}
-	log.Printf("Parsed query: %+v", query) // Using %+v for better struct logging
-
-	req := make([]byte, 2)
-	binary.BigEndian.PutUint16(req, uint16(len(data)))
-	req = append(req, data...)
-	_, errWrite := conn.Write(req)
-	if errWrite != nil {
-		log.Printf("Error writing DNS query to connection: %v", errWrite)
-		return []byte{}
+	reqMsg := new(dns.Msg)
+	err := reqMsg.Unpack(queryBytes)
+	if err != nil {
+		log.Printf("DNSCrypt: failed to unpack query: %v", err)
+		return nil, err
 	}
 
-	reply := make([]byte, 1024) // Standard buffer size for DNS replies
-	nRead, errRead := conn.Read(reply)
-	if errRead != nil {
-		log.Printf("Error reading DNS reply from connection: %v", errRead)
-		return []byte{}
+	// Optional: Log the query details after unpacking
+	// log.Printf("DNSCrypt: Sending query to %s: %s", cryptResolverInfo.ProviderName, reqMsg.Question[0].String())
+
+	replyMsg, err := cryptClient.Exchange(reqMsg, cryptResolverInfo)
+	if err != nil {
+		// Use ProviderName from global cryptResolverInfo for better logging
+		providerName := "unknown resolver"
+		if cryptResolverInfo != nil && cryptResolverInfo.ProviderName != "" {
+			providerName = cryptResolverInfo.ProviderName
+		}
+		log.Printf("DNSCrypt: exchange with resolver '%s' failed: %v", providerName, err)
+		return nil, err
 	}
 
-	if nRead < 2 { // Must have at least 2 bytes for the length field
-		log.Printf("Error: DNS reply too short to contain length field (read %d bytes)", nRead)
-		return []byte{}
+	// Optional: Log the reply details
+	// if replyMsg != nil && len(replyMsg.Answer) > 0 {
+	// 	log.Printf("DNSCrypt: Received reply with answers. First answer: %s", replyMsg.Answer[0].String())
+	// } else if replyMsg != nil {
+	// 	log.Printf("DNSCrypt: Received reply with RCODE: %s", dns.RcodeToString[replyMsg.Rcode])
+	// }
+
+
+	replyBytes, err := replyMsg.Pack()
+	if err != nil {
+		log.Printf("DNSCrypt: failed to pack reply: %v", err)
+		return nil, err
 	}
 
-	var length uint16
-	s := bytes.NewBuffer(reply[:2])
-	errLength := binary.Read(s, binary.BigEndian, &length)
-	if errLength != nil {
-		log.Printf("Error reading length from DNS reply: %v", errLength)
-		return []byte{}
-	}
-
-	if nRead < int(length+2) {
-		log.Printf("Error: DNS reply message length (%d) is shorter than specified length field (%d)", nRead-2, length)
-		return reply[2:nRead] // Return what was read, truncated if necessary
-	}
-	
-	// Correct slice of reply to parse
-	actualReplyData := reply[2 : length+2]
-
-	msg, errParseReply := parseDNSMsg(actualReplyData)
-	if errParseReply != nil {
-		log.Printf("Error parsing DNS reply message: %v. Reply data: %x", errParseReply, actualReplyData)
-		return actualReplyData // Return the raw reply data as per requirement
-	}
-
-	log.Printf("Parsed reply: %+v", msg) // Using %+v for better struct logging
-	return actualReplyData
+	return replyBytes, nil
 }
 
 func dnsListen(conn net.UDPConn) {
 	buf := make([]byte, 1024)
 	n, addr, err := conn.ReadFrom(buf)
-	log.Print("Addr", addr)
-
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error reading from UDP: %v. Client address: %s", err, addr)
+		return // Return to avoid further processing on read error
 	}
-	log.Printf("Data come in from: %s", addr)
+	log.Printf("Data come in from: %s, size: %d bytes", addr, n)
 
-	reply := dnsRequest(buf[0:n])
+	reply, err := dnsRequest(buf[0:n])
+	if err != nil {
+		log.Printf("Failed to get DNS response via DNSCrypt for client %s: %v", addr, err)
+		// Do not send a reply or send a SERVFAIL (out of scope for this PoC)
+		return
+	}
+
+	// If successful, send the reply:
 	_, err = conn.WriteTo(reply, addr)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error writing reply to client %s: %v", addr, err)
 	} else {
-		log.Print("=====EOF=====")
+		providerName := "configured resolver"
+		if cryptResolverInfo != nil && cryptResolverInfo.ProviderName != "" {
+			providerName = cryptResolverInfo.ProviderName
+		}
+		log.Printf("Successfully sent DNSCrypt reply to %s (via %s)", addr, providerName)
 	}
 }
 
 func main() {
-	udpAddr, err := net.ResolveUDPAddr("up4", ":53")
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Fatal(err)
+	// Define command-line flag for the DNSCrypt stamp
+	flag.StringVar(&stampToUse, "stamp", defaultDnsCryptStamp, "DNSCrypt v2 resolver stamp string.")
+	flag.Parse()
+
+	if stampToUse == defaultDnsCryptStamp {
+		log.Printf("Using default DNSCrypt resolver stamp (AdGuard DNS): %s", defaultDnsCryptStamp)
+	} else {
+		log.Printf("Using user-provided DNSCrypt resolver stamp: %s", stampToUse)
 	}
+
+	// Initialize the global DNSCrypt client
+	// Note: The Net field in dnscrypt.Client ("udp" or "tcp") specifies the transport for DNSCrypt itself,
+	// not the transport for the incoming plain DNS queries (which is UDP in our dnsListen function).
+	cryptClient = &dnscrypt.Client{Net: "udp", Timeout: 10 * time.Second}
+
+	var err error // Declare err here so it's accessible for multiple calls if needed
+	cryptResolverInfo, err = cryptClient.Dial(stampToUse)
+	if err != nil {
+		log.Fatalf("DNSCrypt: failed to dial resolver with stamp '%s': %v", stampToUse, err)
+	}
+	log.Printf("Successfully initialized DNSCrypt client with resolver: %s", cryptResolverInfo.ProviderName)
+
+	// Setup UDP listener for incoming plain DNS queries
+	udpAddr, err := net.ResolveUDPAddr("udp4", ":53") // Using "udp4" for IPv4 UDP
+	if err != nil {
+		log.Fatalf("Failed to resolve UDP address :53: %v", err)
+	}
+
+	conn, err := net.ListenUDP("udp4", udpAddr) // Using "udp4"
+	if err != nil {
+		log.Fatalf("Failed to listen on UDP port 53: %v. Ensure the program has necessary permissions (e.g., run with sudo).", err)
+	}
+	defer conn.Close()
+
+	log.Printf("DNS-to-DNSCrypt proxy started. Listening for plain DNS on UDP :53. Forwarding to DNSCrypt resolver: %s.", cryptResolverInfo.ProviderName)
+
+	// Removed the incorrect 'if conn == nil' check here, as ListenUDP would have already returned an error.
 	for {
 		dnsListen(*conn)
 	}
